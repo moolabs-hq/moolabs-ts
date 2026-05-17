@@ -1,110 +1,99 @@
 /**
- * Unified Moolabs SDK facade — `new Moolabs({ apiKey, clsBaseUrl?, meterBaseUrl? })`.
+ * Unified Moolabs SDK facade — capability-based public surface (TypeScript).
  *
- * Hand-written DX layer that sits ON TOP of the openapi-generator
- * typescript-axios output. Copied into the generated tree by `generate.sh`
- * post-codegen when a tuple config sets `dx_dir: sdks/dx/typescript`.
- *
- * Two top-level namespaces customers see:
- *   - `client.cls.*`   → routes to api.moolabs.com (BFF, direct)
- *   - `client.meter.*` → routes to meter.moolabs.com (Meter, direct)
- *
- * Token: ONE `apiKey`, generated in the customer UI, valid against both
- * backends (each backend validates the same token independently — no
- * proxying through BFF).
+ * TypeScript counterpart of sdks/dx/python/moolabs/_dx_client.py. Cross-
+ * language parity (Task H) asserts identical capability list + constructor
+ * signature shape across py/ts/go.
  *
  * Usage:
  *
  *   import { Moolabs } from '@moolabs/sdk';
  *
  *   const client = new Moolabs({ apiKey: 'moo_live_xxx' });
+ *   await client.usage.listEvents();
+ *   await client.usage.ingestEvents([...]);   // F2 fallback + G5 buffer
+ *   await client.close();
  *
- *   // CLS (BFF-routed) — wallets, grants, ledger, billing, etc.
- *   const wallet = await client.cls.wallets.createWallet(...);
- *   const grants = await client.cls.grants.listGrants(...);
+ * Constructor changes from rev-1 (pre-2026-05-15 surface):
+ *   - clsBaseUrl / meterBaseUrl REMOVED — convention-based subdomain derivation
+ *   - baseUrl is the ROOT DOMAIN (default "moolabs.com")
+ *   - buffer flag controls G5 in-memory queue (default true)
+ *   - bufferMax sets the bounded queue size (default 1000)
  *
- *   // Meter (Meter-routed) — events, meters, entitlements, etc.
- *   await client.meter.events.ingestEvents([...]);
- *   const meters = await client.meter.meters.listMeters();
- *
- * NOTE on collisions: BFF and Meter both have `portal` and `subscriptions`
- * tags. The OpenAPI generator emits the first source as `portal-api.ts` /
- * `subscriptions-api.ts` (currently Meter, due to stitch order) and the
- * second with a `0` filename suffix — `portal0-api.ts` is the BFF version.
- * The class names inside both files are the same; routing is determined by
- * which Configuration instance we instantiate them with.
+ * 11 capability getters replace the 2 service namespaces (cls / meter).
  */
-import { Configuration } from './configuration';
-import { WalletsApi } from './api/wallets-api';
-import { GrantsApi } from './api/grants-api';
-import { LedgerApi } from './api/ledger-api';
-import { AlertsApi } from './api/alerts-api';
-import { AutoTopupApi } from './api/auto-topup-api';
-import { RateCardsApi } from './api/rate-cards-api';
-import { RatingApi } from './api/rating-api';
-import { FxRatesApi } from './api/fx-rates-api';
-import { PortalApi as ClsPortalApi } from './api/portal-api';
-import { SubscriptionsApi as ClsSubscriptionsApi } from './api/subscriptions-api';
-import { EventsApi } from './api/events-api';
-import { MetersApi } from './api/meters-api';
-import { CustomersApi } from './api/customers-api';
-import { MeterSubscriptionsApi } from './api/meter-subscriptions-api';
-import { MeterBillingApi } from './api/meter-billing-api';
-import { EntitlementsApi } from './api/entitlements-api';
-import { NotificationsApi } from './api/notifications-api';
-import { AppsApi } from './api/apps-api';
-import { MeterPortalApi } from './api/meter-portal-api';
-import { ProductCatalogApi } from './api/product-catalog-api';
-import { SubjectsApi } from './api/subjects-api';
-export interface MoolabsConfig {
-    /** Customer API key (issued in the Moolabs UI). Same key authenticates
-     *  against both CLS and Meter backends; each validates independently. */
-    apiKey: string;
-    /** Base URL for CLS / billing operations. Default: https://api.moolabs.com */
-    clsBaseUrl?: string;
-    /** Base URL for usage / metering operations. Default: https://meter.moolabs.com */
-    meterBaseUrl?: string;
+import { type Namespace } from './_dx_namespaces';
+/** Optional per-event diagnostic callback. SDK invokes this on
+ *  terminal_drop, overflow, abandoned-on-shutdown, drain-failure events
+ *  with a stable msg id + a structured fields object.
+ *  Default: undefined (no output). Library never writes to console
+ *  unless the customer explicitly provides one. */
+export type LoggerFn = (msg: string, fields: Record<string, unknown>) => void;
+export interface MoolabsOptions {
+    readonly apiKey: string;
+    /** Root domain (host only). Default "moolabs.com". */
+    readonly baseUrl?: string;
+    /** When true (default), F2-chain-exhaustion enqueues events to an
+     *  in-memory buffer instead of throwing. */
+    readonly buffer?: boolean;
+    /** Max events the in-memory buffer holds before drop-oldest. */
+    readonly bufferMax?: number;
+    /** Optional per-event diagnostic logger. Undefined = no output.
+     *  Wire it to your structured logger (pino, winston, console.warn). */
+    readonly logger?: LoggerFn;
 }
-/**
- * Unified Moolabs SDK client.
- *
- *   const client = new Moolabs({ apiKey: 'moo_live_...' });
- *   await client.cls.wallets.createWallet(...);
- *   await client.meter.events.ingestEvents([...]);
- */
+/** PascalCase → kebab-case file name (TS generator emits kebab-case files:
+ *  "WalletsApi" → "wallets-api.ts"). Exported for the cross-language parity job. */
+export declare function pascalToKebab(name: string): string;
 export declare class Moolabs {
-    readonly cls: ClsNamespace;
-    readonly meter: MeterNamespace;
-    constructor(config: MoolabsConfig);
-}
-/** All operations that route to the CLS / BFF backend (api.moolabs.com). */
-export declare class ClsNamespace {
-    private readonly cfg;
-    constructor(cfg: Configuration);
-    get wallets(): WalletsApi;
-    get grants(): GrantsApi;
-    get ledger(): LedgerApi;
-    get alerts(): AlertsApi;
-    get autoTopup(): AutoTopupApi;
-    get rateCards(): RateCardsApi;
-    get rating(): RatingApi;
-    get fxRates(): FxRatesApi;
-    get portal(): ClsPortalApi;
-    get subscriptions(): ClsSubscriptionsApi;
-}
-/** All operations that route to the Meter backend (meter.moolabs.com). */
-export declare class MeterNamespace {
-    private readonly cfg;
-    constructor(cfg: Configuration);
-    get events(): EventsApi;
-    get meters(): MetersApi;
-    get customers(): CustomersApi;
-    get subscriptions(): MeterSubscriptionsApi;
-    get billing(): MeterBillingApi;
-    get entitlements(): EntitlementsApi;
-    get notifications(): NotificationsApi;
-    get apps(): AppsApi;
-    get portal(): MeterPortalApi;
-    get productCatalog(): ProductCatalogApi;
-    get subjects(): SubjectsApi;
+    private readonly apiKey;
+    private readonly baseUrl;
+    private readonly bufferEnabled;
+    private readonly bufferMax;
+    private readonly logger;
+    private readonly ingestResolver;
+    private ingestBuffer;
+    private readonly inflightDrains;
+    private readonly clients;
+    private readonly namespaces;
+    constructor(opts: MoolabsOptions);
+    get usage(): Namespace;
+    get customers(): Namespace;
+    get catalog(): Namespace;
+    get subscriptions(): Namespace;
+    get entitlements(): Namespace;
+    get wallets(): Namespace;
+    get credits(): Namespace;
+    get billing(): Namespace;
+    get collections(): Namespace;
+    get cost(): Namespace;
+    get notifications(): Namespace;
+    close(): Promise<void>;
+    toString(): string;
+    private ns;
+    private getClient;
+    private makeClientAtUrl;
+    private lazyBuffer;
+    /** Drain callback — fire-and-forget POST.
+     *
+     *  Customer chose at-most-once delivery semantics (round-5 review):
+     *  drain returns delivered=events.length immediately, buffer removes
+     *  the events, fetch+keepalive runs in the background. Failed requests
+     *  are silently lost (logged via customer Logger if provided + counted
+     *  via terminalDrops/dropped stats; events themselves are gone).
+     *
+     *  Why fetch+keepalive instead of awaited axios:
+     *  - keepalive: true tells the browser to complete the request even
+     *    if the page unloads. Last events sent before navigation aren't
+     *    lost mid-flight. Node ignores the flag (no impact).
+     *  - No await: drain tick doesn't wait for HTTP. Even if the backend
+     *    is slow, drain ticks at the configured interval.
+     *  - The Promise is intentionally unobserved; errors are surfaced
+     *    via .catch() into stats + Logger.
+     *
+     *  Why bypass the openapi-generator's typed EventsApi: same reason as
+     *  Go's postEventsBatch — typed client uses axios with await semantics;
+     *  we want raw fetch with keepalive control. */
+    private bufferDrainCallback;
+    private discoverTenantConfig;
 }

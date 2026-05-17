@@ -1,142 +1,358 @@
 /**
- * Unified Moolabs SDK facade — `new Moolabs({ apiKey, clsBaseUrl?, meterBaseUrl? })`.
+ * Unified Moolabs SDK facade — capability-based public surface (TypeScript).
  *
- * Hand-written DX layer that sits ON TOP of the openapi-generator
- * typescript-axios output. Copied into the generated tree by `generate.sh`
- * post-codegen when a tuple config sets `dx_dir: sdks/dx/typescript`.
- *
- * Two top-level namespaces customers see:
- *   - `client.cls.*`   → routes to api.moolabs.com (BFF, direct)
- *   - `client.meter.*` → routes to meter.moolabs.com (Meter, direct)
- *
- * Token: ONE `apiKey`, generated in the customer UI, valid against both
- * backends (each backend validates the same token independently — no
- * proxying through BFF).
+ * TypeScript counterpart of sdks/dx/python/moolabs/_dx_client.py. Cross-
+ * language parity (Task H) asserts identical capability list + constructor
+ * signature shape across py/ts/go.
  *
  * Usage:
  *
  *   import { Moolabs } from '@moolabs/sdk';
  *
  *   const client = new Moolabs({ apiKey: 'moo_live_xxx' });
+ *   await client.usage.listEvents();
+ *   await client.usage.ingestEvents([...]);   // F2 fallback + G5 buffer
+ *   await client.close();
  *
- *   // CLS (BFF-routed) — wallets, grants, ledger, billing, etc.
- *   const wallet = await client.cls.wallets.createWallet(...);
- *   const grants = await client.cls.grants.listGrants(...);
+ * Constructor changes from rev-1 (pre-2026-05-15 surface):
+ *   - clsBaseUrl / meterBaseUrl REMOVED — convention-based subdomain derivation
+ *   - baseUrl is the ROOT DOMAIN (default "moolabs.com")
+ *   - buffer flag controls G5 in-memory queue (default true)
+ *   - bufferMax sets the bounded queue size (default 1000)
  *
- *   // Meter (Meter-routed) — events, meters, entitlements, etc.
- *   await client.meter.events.ingestEvents([...]);
- *   const meters = await client.meter.meters.listMeters();
- *
- * NOTE on collisions: BFF and Meter both have `portal` and `subscriptions`
- * tags. The OpenAPI generator emits the first source as `portal-api.ts` /
- * `subscriptions-api.ts` (currently Meter, due to stitch order) and the
- * second with a `0` filename suffix — `portal0-api.ts` is the BFF version.
- * The class names inside both files are the same; routing is determined by
- * which Configuration instance we instantiate them with.
+ * 11 capability getters replace the 2 service namespaces (cls / meter).
  */
 
-import { Configuration } from './configuration';
+import { IngestBuffer, type IngestBufferConfig } from './_dx_buffer';
+import { type Namespace, makeNamespace, isTerminalIngestError } from './_dx_namespaces';
+import { postEventsBatchAndClassify } from './_dx_post';
+import { CAPABILITY_ORDER, type Backend, SUBDOMAIN_MAP } from './_dx_routing';
+import {
+    DISCOVERY_PATH,
+    IngestUrlResolver,
+    METER_INGEST_PATH,
+    deriveHost,
+} from './_dx_urls';
 
-// CLS / BFF backend api classes
-import { WalletsApi } from './api/wallets-api';
-import { GrantsApi } from './api/grants-api';
-import { LedgerApi } from './api/ledger-api';
-import { AlertsApi } from './api/alerts-api';
-import { AutoTopupApi } from './api/auto-topup-api';
-import { RateCardsApi } from './api/rate-cards-api';
-import { RatingApi } from './api/rating-api';
-import { FxRatesApi } from './api/fx-rates-api';
-import { PortalApi as ClsPortalApi } from './api/portal-api';
-import { SubscriptionsApi as ClsSubscriptionsApi } from './api/subscriptions-api';
+// Lazy import marker — the generated layer's Configuration / ApiClient
+// modules are loaded only when a capability is actually used. Until then
+// `new Moolabs({...})` does no I/O and no module loading.
+type GeneratedConfiguration = new (params: { basePath?: string; accessToken?: string }) => unknown;
 
-// Meter backend api classes (Title-case Meter tags renamed at stitch time
-// to MeterPortal/MeterSubscriptions/MeterBilling so they don't merge with
-// BFF's lowercase portal/subscriptions/billing classes)
-import { EventsApi } from './api/events-api';
-import { MetersApi } from './api/meters-api';
-import { CustomersApi } from './api/customers-api';
-import { MeterSubscriptionsApi } from './api/meter-subscriptions-api';
-import { MeterBillingApi } from './api/meter-billing-api';
-import { EntitlementsApi } from './api/entitlements-api';
-import { NotificationsApi } from './api/notifications-api';
-import { AppsApi } from './api/apps-api';
-import { MeterPortalApi } from './api/meter-portal-api';
-import { ProductCatalogApi } from './api/product-catalog-api';
-import { SubjectsApi } from './api/subjects-api';
 
-export interface MoolabsConfig {
-    /** Customer API key (issued in the Moolabs UI). Same key authenticates
-     *  against both CLS and Meter backends; each validates independently. */
-    apiKey: string;
-    /** Base URL for CLS / billing operations. Default: https://api.moolabs.com */
-    clsBaseUrl?: string;
-    /** Base URL for usage / metering operations. Default: https://meter.moolabs.com */
-    meterBaseUrl?: string;
+const DEFAULT_BASE_URL = 'moolabs.com';
+
+// CloudEvents batch ingest path is METER_INGEST_PATH (imported from
+// _dx_urls.ts so both the resolver and the direct-post path agree on
+// the route). The matching Content-Type
+// (application/cloudevents-batch+json) lives in _dx_post.ts where the
+// actual fetch happens — keeping the header next to the request body
+// it describes.
+const INGEST_PATH = METER_INGEST_PATH;
+
+
+/** Optional per-event diagnostic callback. SDK invokes this on
+ *  terminal_drop, overflow, abandoned-on-shutdown, drain-failure events
+ *  with a stable msg id + a structured fields object.
+ *  Default: undefined (no output). Library never writes to console
+ *  unless the customer explicitly provides one. */
+export type LoggerFn = (msg: string, fields: Record<string, unknown>) => void;
+
+export interface MoolabsOptions {
+    readonly apiKey: string;
+    /** Root domain (host only). Default "moolabs.com". */
+    readonly baseUrl?: string;
+    /** When true (default), F2-chain-exhaustion enqueues events to an
+     *  in-memory buffer instead of throwing. */
+    readonly buffer?: boolean;
+    /** Max events the in-memory buffer holds before drop-oldest. */
+    readonly bufferMax?: number;
+    /** Optional per-event diagnostic logger. Undefined = no output.
+     *  Wire it to your structured logger (pino, winston, console.warn). */
+    readonly logger?: LoggerFn;
 }
 
-const DEFAULT_CLS_BASE_URL = 'https://api.moolabs.com';
-const DEFAULT_METER_BASE_URL = 'https://meter.moolabs.com';
+const noopLogger: LoggerFn = () => { /* no-op default */ };
 
-/**
- * Unified Moolabs SDK client.
- *
- *   const client = new Moolabs({ apiKey: 'moo_live_...' });
- *   await client.cls.wallets.createWallet(...);
- *   await client.meter.events.ingestEvents([...]);
- */
-export class Moolabs {
-    public readonly cls: ClsNamespace;
-    public readonly meter: MeterNamespace;
 
-    constructor(config: MoolabsConfig) {
-        if (!config.apiKey) {
-            throw new Error('Moolabs: apiKey is required');
+/** PascalCase → kebab-case file name (TS generator emits kebab-case files:
+ *  "WalletsApi" → "wallets-api.ts"). Exported for the cross-language parity job. */
+export function pascalToKebab(name: string): string {
+    return name.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+}
+
+
+/** Lazy import of a generated API class. The typescript-axios generator
+ *  emits classes under `./api/<kebab>-api.ts`. */
+function importApiClass(className: string): new (config?: unknown) => Record<string, unknown> {
+    const moduleName = `./api/${pascalToKebab(className)}`;
+    // require() rather than dynamic import() because the typescript-axios
+    // output is CommonJS by default in this project. The install_check
+    // verifies the import path works at smoke time.
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment
+        const mod = require(moduleName);
+        const cls = (mod as Record<string, unknown>)[className];
+        if (typeof cls !== 'function') {
+            throw new Error(`module ${moduleName} exports no class ${className}`);
         }
-        const clsHost = (config.clsBaseUrl ?? DEFAULT_CLS_BASE_URL).replace(/\/$/, '');
-        const meterHost = (config.meterBaseUrl ?? DEFAULT_METER_BASE_URL).replace(/\/$/, '');
-
-        // openapi-generator's typescript-axios Configuration accepts:
-        //   accessToken — used as `Authorization: Bearer <token>` for http+bearer security
-        //   basePath    — overrides the spec's `servers`
-        const clsCfg = new Configuration({ accessToken: config.apiKey, basePath: clsHost });
-        const meterCfg = new Configuration({ accessToken: config.apiKey, basePath: meterHost });
-
-        this.cls = new ClsNamespace(clsCfg);
-        this.meter = new MeterNamespace(meterCfg);
+        return cls as new (config?: unknown) => Record<string, unknown>;
+    } catch (e) {
+        const cause = e instanceof Error ? e.message : String(e);
+        throw new Error(
+            `could not import ${moduleName} (backing class ${className} for the SDK's ` +
+            `capability routing map). Re-run codegen or check _dx_routing.CAPABILITY_MAP. ` +
+            `Original: ${cause}`
+        );
     }
 }
 
-/** All operations that route to the CLS / BFF backend (api.moolabs.com). */
-export class ClsNamespace {
-    constructor(private readonly cfg: Configuration) {}
 
-    get wallets(): WalletsApi { return new WalletsApi(this.cfg); }
-    get grants(): GrantsApi { return new GrantsApi(this.cfg); }
-    get ledger(): LedgerApi { return new LedgerApi(this.cfg); }
-    get alerts(): AlertsApi { return new AlertsApi(this.cfg); }
-    get autoTopup(): AutoTopupApi { return new AutoTopupApi(this.cfg); }
-    // NOTE: cls.billing intentionally absent — BFF openapi.json currently
-    // emits 0 ops under `billing`. Add a property when BFF exposes them.
-    get rateCards(): RateCardsApi { return new RateCardsApi(this.cfg); }
-    get rating(): RatingApi { return new RatingApi(this.cfg); }
-    get fxRates(): FxRatesApi { return new FxRatesApi(this.cfg); }
-    get portal(): ClsPortalApi { return new ClsPortalApi(this.cfg); }
-    get subscriptions(): ClsSubscriptionsApi { return new ClsSubscriptionsApi(this.cfg); }
-}
+export class Moolabs {
+    private readonly apiKey: string;
+    private readonly baseUrl: string;
+    private readonly bufferEnabled: boolean;
+    private readonly bufferMax: number;
+    private readonly logger: LoggerFn;
 
-/** All operations that route to the Meter backend (meter.moolabs.com). */
-export class MeterNamespace {
-    constructor(private readonly cfg: Configuration) {}
+    private readonly ingestResolver: IngestUrlResolver;
+    private ingestBuffer: IngestBuffer<unknown> | null = null;
 
-    get events(): EventsApi { return new EventsApi(this.cfg); }
-    get meters(): MetersApi { return new MetersApi(this.cfg); }
-    get customers(): CustomersApi { return new CustomersApi(this.cfg); }
-    get subscriptions(): MeterSubscriptionsApi { return new MeterSubscriptionsApi(this.cfg); }
-    get billing(): MeterBillingApi { return new MeterBillingApi(this.cfg); }
-    get entitlements(): EntitlementsApi { return new EntitlementsApi(this.cfg); }
-    get notifications(): NotificationsApi { return new NotificationsApi(this.cfg); }
-    get apps(): AppsApi { return new AppsApi(this.cfg); }
-    get portal(): MeterPortalApi { return new MeterPortalApi(this.cfg); }
-    get productCatalog(): ProductCatalogApi { return new ProductCatalogApi(this.cfg); }
-    get subjects(): SubjectsApi { return new SubjectsApi(this.cfg); }
+    // Round-4 I-NEW-4: track in-flight fetch Promises from the no-await
+    // bufferDrainCallback so close() can await them. Without this,
+    // close() returns while the final batch's HTTP is still on the wire;
+    // in serverless/Lambda contexts the runtime can freeze the container
+    // and kill the request mid-flight.
+    private readonly inflightDrains = new Set<Promise<void>>();
+
+    private readonly clients = new Map<Backend, unknown>();
+    private readonly namespaces = new Map<string, Namespace>();
+
+    constructor(opts: MoolabsOptions) {
+        if (typeof opts.apiKey !== 'string' || opts.apiKey.length === 0) {
+            throw new Error('apiKey must be a non-empty string');
+        }
+        this.apiKey = opts.apiKey;
+        this.baseUrl = opts.baseUrl ?? DEFAULT_BASE_URL;
+
+        // Validate baseUrl early so a typo crashes at construction.
+        for (const backend of Object.keys(SUBDOMAIN_MAP) as Backend[]) {
+            deriveHost(backend, this.baseUrl);   // throws on invalid baseUrl
+        }
+
+        this.bufferEnabled = opts.buffer !== false;   // default true
+        this.bufferMax = opts.bufferMax ?? 1000;   // matches DEFAULT_INGEST_BUFFER_CONFIG.maxSize
+        // Optional per-event logger; default = no output.
+        this.logger = opts.logger ?? noopLogger;
+
+        this.ingestResolver = new IngestUrlResolver({
+            baseUrl: this.baseUrl,
+            discoveryFn: () => this.discoverTenantConfig(),
+        });
+    }
+
+    // ── Capability getters (lazy namespace construction) ────────────────
+
+    get usage(): Namespace        { return this.ns('usage'); }
+    get customers(): Namespace    { return this.ns('customers'); }
+    get catalog(): Namespace      { return this.ns('catalog'); }
+    get subscriptions(): Namespace { return this.ns('subscriptions'); }
+    get entitlements(): Namespace { return this.ns('entitlements'); }
+    get wallets(): Namespace      { return this.ns('wallets'); }
+    get credits(): Namespace      { return this.ns('credits'); }
+    get billing(): Namespace      { return this.ns('billing'); }
+    get collections(): Namespace  { return this.ns('collections'); }
+    get cost(): Namespace         { return this.ns('cost'); }
+    get notifications(): Namespace { return this.ns('notifications'); }
+
+    // ── Lifecycle ────────────────────────────────────────────────────────
+
+    async close(): Promise<void> {
+        if (this.ingestBuffer !== null) {
+            await this.ingestBuffer.close();
+            this.ingestBuffer = null;
+        }
+        // Round-4 I-NEW-4: bufferDrainCallback fires no-await fetch
+        // Promises tracked in inflightDrains. close() must wait for
+        // them so that "after close() returns, no more HTTP" holds.
+        // Bounded by the buffer's shutdown timeout — if a fetch is
+        // still in flight after 60s, we give up (in-flight request
+        // continues in the background but close() returns).
+        if (this.inflightDrains.size > 0) {
+            // Generated SDK's tsconfig targets pre-ES2020; can't use
+            // Promise.allSettled directly. Manually convert each rejection
+            // to a fulfilled void so Promise.all doesn't short-circuit.
+            const settled = Promise.all(
+                [...this.inflightDrains].map((p) =>
+                    p.catch((): void => undefined),
+                ),
+            );
+            await Promise.race([
+                settled.then((): void => undefined),
+                new Promise<void>((resolve) => setTimeout(resolve, 60_000)),
+            ]);
+        }
+        // typescript-axios's generated ApiClient doesn't have a close(); the
+        // underlying axios instance is GC'd when references drop. Just clear
+        // our caches.
+        this.clients.clear();
+        this.namespaces.clear();
+    }
+
+    toString(): string {
+        return `Moolabs(baseUrl=${JSON.stringify(this.baseUrl)}, buffer=${this.bufferEnabled}, capabilities=${CAPABILITY_ORDER.length})`;
+    }
+
+    // ── Internals ────────────────────────────────────────────────────────
+
+    private ns(capability: string): Namespace {
+        const cached = this.namespaces.get(capability);
+        if (cached !== undefined) return cached;
+        const opts: Parameters<typeof makeNamespace>[1] = {
+            getClient: (b) => this.getClient(b),
+            importApiClass,
+        };
+        if (capability === 'usage') {
+            opts.ingestResolver = this.ingestResolver;
+            opts.ingestBuffer = this.lazyBuffer();
+            opts.makeClientAtUrl = (url) => this.makeClientAtUrl(url);
+        }
+        const n = makeNamespace(capability, opts);
+        this.namespaces.set(capability, n);
+        return n;
+    }
+
+    private getClient(backend: Backend): unknown {
+        const cached = this.clients.get(backend);
+        if (cached !== undefined) return cached;
+        const host = deriveHost(backend, this.baseUrl);
+        const client = this.makeClientAtUrl(host);
+        this.clients.set(backend, client);
+        return client;
+    }
+
+    private makeClientAtUrl(host: string): unknown {
+        // typescript-axios's Configuration accepts `basePath` and `accessToken`.
+        // Lazy-load via require so `import { Moolabs }` is fast.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const mod = require('./configuration') as { Configuration: GeneratedConfiguration };
+        return new mod.Configuration({ basePath: host, accessToken: this.apiKey });
+    }
+
+    private lazyBuffer(): IngestBuffer<unknown> | null {
+        if (!this.bufferEnabled) return null;
+        if (this.ingestBuffer === null) {
+            const cfg: Partial<IngestBufferConfig> = { maxSize: this.bufferMax };
+            this.ingestBuffer = new IngestBuffer<unknown>({
+                drainCallback: (events) => this.bufferDrainCallback(events),
+                config: cfg,
+                logger: this.logger,    // propagate customer-supplied logger (noop default)
+            });
+            this.ingestBuffer.start();
+        }
+        return this.ingestBuffer;
+    }
+
+    /** Drain callback — fire-and-forget POST.
+     *
+     *  Customer chose at-most-once delivery semantics (round-5 review):
+     *  drain returns delivered=events.length immediately, buffer removes
+     *  the events, fetch+keepalive runs in the background. Failed requests
+     *  are silently lost (logged via customer Logger if provided + counted
+     *  via terminalDrops/dropped stats; events themselves are gone).
+     *
+     *  Why fetch+keepalive instead of awaited axios:
+     *  - keepalive: true tells the browser to complete the request even
+     *    if the page unloads. Last events sent before navigation aren't
+     *    lost mid-flight. Node ignores the flag (no impact).
+     *  - No await: drain tick doesn't wait for HTTP. Even if the backend
+     *    is slow, drain ticks at the configured interval.
+     *  - The Promise is intentionally unobserved; errors are surfaced
+     *    via .catch() into stats + Logger.
+     *
+     *  Why bypass the openapi-generator's typed EventsApi: same reason as
+     *  Go's postEventsBatch — typed client uses axios with await semantics;
+     *  we want raw fetch with keepalive control. */
+    // Returns a Promise to satisfy the DrainCallback contract; the
+    // Promise resolves synchronously with events.length because the
+    // actual HTTP is fire-and-forget (no await). The buffer treats
+    // the events as "delivered" immediately (removed from queue).
+    private async bufferDrainCallback(events: unknown[]): Promise<number> {
+        // Resolve URL synchronously from cache if available. If the
+        // resolver needs to do discovery, we fall through to step 4
+        // (always-derivable last-resort URL) rather than awaiting.
+        const url = this.ingestResolver.cached
+            ?? `https://meter.${this.baseUrl}${INGEST_PATH}`;
+
+        // Fire-and-forget. No await — Promise tracked in inflightDrains
+        // so close() can await pending requests before returning
+        // (round-4 I-NEW-4). The HTTP + classification path is extracted
+        // into postEventsBatchAndClassify (round-5 — closes I-NEW-1) so
+        // that surface is testable in isolation; the side-effect
+        // dispatch below stays here because it touches client state.
+        const inflight: Promise<void> = postEventsBatchAndClassify(
+            url,
+            this.apiKey,
+            events,
+        ).then((outcome) => {
+            switch (outcome.type) {
+                case 'success':
+                    this.ingestResolver.reportPostOutcome(url, true);
+                    return;
+                case 'terminal':
+                    // Events already removed; counter + log.
+                    if (this.ingestBuffer !== null) {
+                        this.ingestBuffer.recordTerminalDrop(events.length);
+                    }
+                    this.logger('moolabs.ingest_buffer.terminal_drop', {
+                        status: outcome.status,
+                        count: events.length,
+                    });
+                    return;
+                case 'transient':
+                    // Penalize URL, log. Events are GONE (at-most-once);
+                    // customer who needs at-least-once should set
+                    // buffer=false for synchronous mode.
+                    this.ingestResolver.reportPostOutcome(url, false);
+                    this.logger('moolabs.ingest_buffer.transient_drop', {
+                        status: outcome.status,
+                        count: events.length,
+                    });
+                    return;
+                case 'network':
+                    // Network error / abort / DNS failure. Penalize URL, log.
+                    this.ingestResolver.reportPostOutcome(url, false);
+                    this.logger('moolabs.ingest_buffer.network_drop', {
+                        count: events.length,
+                        err: String(outcome.err),
+                    });
+                    return;
+            }
+        });
+        // Track for close() awaiting. Self-cleanup via finally.
+        this.inflightDrains.add(inflight);
+        void inflight.finally(() => { this.inflightDrains.delete(inflight); });
+
+        // Optimistically tell the buffer the events are "delivered" —
+        // they're removed from the buffer's queue. The fire-and-forget
+        // Promise above handles the actual HTTP outcome separately.
+        return events.length;
+    }
+
+    private async discoverTenantConfig(): Promise<{ endpoints?: { ingest?: string } }> {
+        const host = deriveHost('bff', this.baseUrl);
+        const url = `${host}${DISCOVERY_PATH}`;
+        // Use the platform's fetch (Node 18+ has it natively; older Node + bun
+        // also expose it). Customers on Node <18 should polyfill at app level.
+        const resp = await fetch(url, {
+            headers: {
+                Authorization: `Bearer ${this.apiKey}`,
+                Accept: 'application/json',
+            },
+        });
+        if (!resp.ok) {
+            throw new Error(`/tenant/config returned ${resp.status}`);
+        }
+        return resp.json() as Promise<{ endpoints?: { ingest?: string } }>;
+    }
 }

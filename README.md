@@ -90,7 +90,7 @@ Routes calls to `https://meter.moolabs.com`.
 ### Ingest usage events
 
 ```typescript
-await client.meter.events.ingestEvents([
+await client.usage.ingestEvents([
   {
     id: 'evt_unique_id',
     type: 'api.request',
@@ -100,6 +100,52 @@ await client.meter.events.ingestEvents([
   },
 ]);
 ```
+
+#### Event delivery semantics — IMPORTANT for browser SDK users
+
+The TypeScript SDK delivers events with **at-most-once semantics by default**.
+This is intentional, and it is **different from the Python and Go SDKs**, which
+deliver at-least-once.
+
+**What this means in practice:**
+- Your `await client.usage.ingestEvents(...)` returns immediately
+  (microseconds) — the SDK does NOT block on the network.
+- A background timer fires `fetch(url, { keepalive: true })` to deliver
+  the batch. The Promise is intentionally not awaited so the customer's
+  main thread is never blocked.
+- If the network request fails (5xx, network error, DNS), the events
+  are **silently lost** — they cannot be retried because they've already
+  been removed from the in-memory buffer.
+- Counters (`stats().dropped`, `stats().terminalDrops`) and the
+  customer-supplied `logger` callback surface the loss for monitoring;
+  the events themselves are gone.
+
+**Why this design?** Browser SDKs must use `fetch + keepalive` to survive
+page navigation/unload — `await` semantics aren't available during
+`beforeunload`. This is the same approach Datadog RUM, Segment, and
+Amplitude use. The trade-off is intentional: zero blocking on your hot
+path in exchange for losing the small fraction of events that hit
+transient failures.
+
+**If you need at-least-once delivery** (e.g. you're emitting billing
+events where every event is revenue):
+
+```typescript
+const client = new Moolabs({
+  apiKey: 'moo_live_...',
+  buffer: false,   // strict-sync mode
+});
+
+// Now ingest blocks until delivery confirmation
+await client.usage.ingestEvents([...]);   // throws on failure
+```
+
+In sync mode, `ingestEvents` blocks the calling thread for the HTTP
+round-trip, but you get error-on-failure semantics. The Python and Go
+SDKs default to at-least-once and don't have this trade-off.
+
+**Monitoring:** poll `client.usage.bufferStats()` periodically for
+`dropped` / `terminalDrops` to detect data loss.
 
 ### Check entitlement
 
