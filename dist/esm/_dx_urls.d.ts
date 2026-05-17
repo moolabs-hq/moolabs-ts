@@ -1,12 +1,18 @@
 /**
  * URL derivation + F2 ingest fallback chain — TypeScript port of _dx_urls.py.
  *
- * Same two responsibilities as the Python version:
+ * Three responsibilities (same as the Python version):
  *
- *   1. `deriveHost(backend, baseUrl)` — convention-based subdomain rewriting.
+ *   1. `resolveEffectiveBaseUrl(baseUrl, apiKey)` — init-time rewrite of
+ *      the customer-supplied baseUrl. Apex (moolabs.com) gets an env
+ *      prefix injected from the key; explicit env roots and self-hosted
+ *      bases pass through unchanged. Pure function, no state.
+ *      **Called exactly once in the Moolabs constructor** — see _dx_client.ts.
+ *
+ *   2. `deriveHost(backend, baseUrl)` — convention-based subdomain rewriting.
  *      Pure function, no state.
  *
- *   2. `IngestUrlResolver` — stateful F2 fallback chain for the event-ingest
+ *   3. `IngestUrlResolver` — stateful F2 fallback chain for the event-ingest
  *      hot path (contracts §3.5). Resolves the URL to POST events to via a
  *      4-step chain.
  *
@@ -29,6 +35,25 @@ declare const DISCOVERY_PATH = "/v1/tenant/config";
  * Empty or syntactically invalid input throws — caught at construction time.
  */
 export declare function normalizeBaseUrl(baseUrl: string): string;
+/**
+ * Extract the "{env}-{region}" prefix from a region-aware API key.
+ * Future key format: "{env}-{region}-{random}". Returns null for legacy
+ * raw-hex keys (no prefix).
+ */
+export declare function extractEnvPrefix(apiKey: string): string | null;
+/**
+ * Resolve the effective baseUrl used for SDK subdomain composition.
+ * Called exactly ONCE in the Moolabs constructor — never per-call.
+ *
+ * Three rules:
+ *
+ *   1. baseUrl is NOT a known customer-facing apex (e.g. dev.moolabs.com,
+ *      tenant.example.com): use as-is.
+ *   2. baseUrl IS apex AND key has env-region prefix: inject the prefix
+ *      → "prod-us.moolabs.com".
+ *   3. baseUrl IS apex AND key is legacy: fall back to "prod.{apex}".
+ */
+export declare function resolveEffectiveBaseUrl(baseUrl: string, apiKey: string): string;
 /** Return `https://{subdomain}.{baseUrl}` for a backend. */
 export declare function deriveHost(backend: Backend, baseUrl: string): string;
 /**

@@ -35,7 +35,7 @@ import { IngestBuffer } from './_dx_buffer';
 import { makeNamespace } from './_dx_namespaces';
 import { postEventsBatchAndClassify } from './_dx_post';
 import { CAPABILITY_ORDER, SUBDOMAIN_MAP } from './_dx_routing';
-import { DISCOVERY_PATH, IngestUrlResolver, METER_INGEST_PATH, deriveHost, } from './_dx_urls';
+import { DISCOVERY_PATH, IngestUrlResolver, METER_INGEST_PATH, deriveHost, resolveEffectiveBaseUrl, } from './_dx_urls';
 const DEFAULT_BASE_URL = 'moolabs.com';
 // CloudEvents batch ingest path is METER_INGEST_PATH (imported from
 // _dx_urls.ts so both the resolver and the direct-post path agree on
@@ -89,7 +89,13 @@ export class Moolabs {
             throw new Error('apiKey must be a non-empty string');
         }
         this.apiKey = opts.apiKey;
-        this.baseUrl = (_a = opts.baseUrl) !== null && _a !== void 0 ? _a : DEFAULT_BASE_URL;
+        // Apex ("moolabs.com") is a marketing/branding host, not an env
+        // root — the ALB cert is "*.prod.moolabs.com" only. Rewrite the
+        // customer-supplied baseUrl ONCE at construction so all downstream
+        // subdomain composition (deriveHost, IngestUrlResolver) sees the
+        // effective env-rooted host. Explicit env roots and self-hosted
+        // bases pass through unchanged. See _dx_urls.resolveEffectiveBaseUrl.
+        this.baseUrl = resolveEffectiveBaseUrl((_a = opts.baseUrl) !== null && _a !== void 0 ? _a : DEFAULT_BASE_URL, this.apiKey);
         // Validate baseUrl early so a typo crashes at construction.
         for (const backend of Object.keys(SUBDOMAIN_MAP)) {
             deriveHost(backend, this.baseUrl); // throws on invalid baseUrl

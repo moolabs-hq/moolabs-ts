@@ -1,12 +1,18 @@
 /**
  * URL derivation + F2 ingest fallback chain — TypeScript port of _dx_urls.py.
  *
- * Same two responsibilities as the Python version:
+ * Three responsibilities (same as the Python version):
  *
- *   1. `deriveHost(backend, baseUrl)` — convention-based subdomain rewriting.
+ *   1. `resolveEffectiveBaseUrl(baseUrl, apiKey)` — init-time rewrite of
+ *      the customer-supplied baseUrl. Apex (moolabs.com) gets an env
+ *      prefix injected from the key; explicit env roots and self-hosted
+ *      bases pass through unchanged. Pure function, no state.
+ *      **Called exactly once in the Moolabs constructor** — see _dx_client.ts.
+ *
+ *   2. `deriveHost(backend, baseUrl)` — convention-based subdomain rewriting.
  *      Pure function, no state.
  *
- *   2. `IngestUrlResolver` — stateful F2 fallback chain for the event-ingest
+ *   3. `IngestUrlResolver` — stateful F2 fallback chain for the event-ingest
  *      hot path (contracts §3.5). Resolves the URL to POST events to via a
  *      4-step chain.
  *
@@ -59,6 +65,67 @@ export function normalizeBaseUrl(baseUrl) {
         throw new Error(`baseUrl has no parseable host: ${JSON.stringify(baseUrl)}`);
     }
     return host;
+}
+// ── Effective base_url resolution (init-time only) ──────────────────────
+//
+// Customer-facing apex domains where the SDK injects an env prefix derived
+// from the API key. Bare apex like "moolabs.com" is a marketing/branding
+// host, not an env root — the ALB cert is "*.prod.moolabs.com" (no SAN
+// for "*.moolabs.com"), so the SDK must compose subdomains under an env
+// root like "prod.moolabs.com".
+//
+// Add new entries here when Moolabs adds new customer-facing apex TLDs.
+// Self-hosted customers passing their own root pass through unchanged.
+const INJECT_ENV_APEXES = new Set(['moolabs.com']);
+/** Env tokens the SDK recognizes in the API key. Future region-aware keys
+ * have the form "{env}-{region}-{rand}", e.g. "prod-us-d0b7403...". */
+const KNOWN_ENV_TOKENS = new Set(['prod', 'dev', 'staging']);
+/** Fallback env root for legacy unprefixed keys with an apex baseUrl.
+ * Today this is the only deployed env root with a valid wildcard cert. */
+const LEGACY_KEY_FALLBACK_ENV = 'prod';
+/**
+ * Extract the "{env}-{region}" prefix from a region-aware API key.
+ * Future key format: "{env}-{region}-{random}". Returns null for legacy
+ * raw-hex keys (no prefix).
+ */
+export function extractEnvPrefix(apiKey) {
+    if (typeof apiKey !== 'string' || apiKey.length === 0) {
+        return null;
+    }
+    // Split into AT MOST 3 parts so the random tail can contain dashes.
+    const dash1 = apiKey.indexOf('-');
+    if (dash1 < 0)
+        return null;
+    const dash2 = apiKey.indexOf('-', dash1 + 1);
+    if (dash2 < 0)
+        return null;
+    const env = apiKey.substring(0, dash1);
+    const region = apiKey.substring(dash1 + 1, dash2);
+    if (!KNOWN_ENV_TOKENS.has(env) || region.length === 0) {
+        return null;
+    }
+    return `${env}-${region}`;
+}
+/**
+ * Resolve the effective baseUrl used for SDK subdomain composition.
+ * Called exactly ONCE in the Moolabs constructor — never per-call.
+ *
+ * Three rules:
+ *
+ *   1. baseUrl is NOT a known customer-facing apex (e.g. dev.moolabs.com,
+ *      tenant.example.com): use as-is.
+ *   2. baseUrl IS apex AND key has env-region prefix: inject the prefix
+ *      → "prod-us.moolabs.com".
+ *   3. baseUrl IS apex AND key is legacy: fall back to "prod.{apex}".
+ */
+export function resolveEffectiveBaseUrl(baseUrl, apiKey) {
+    var _a;
+    const normalized = normalizeBaseUrl(baseUrl);
+    if (!INJECT_ENV_APEXES.has(normalized)) {
+        return normalized;
+    }
+    const envPrefix = (_a = extractEnvPrefix(apiKey)) !== null && _a !== void 0 ? _a : LEGACY_KEY_FALLBACK_ENV;
+    return `${envPrefix}.${normalized}`;
 }
 /** Return `https://{subdomain}.{baseUrl}` for a backend. */
 export function deriveHost(backend, baseUrl) {

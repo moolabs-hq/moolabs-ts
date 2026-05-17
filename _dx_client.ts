@@ -32,6 +32,7 @@ import {
     IngestUrlResolver,
     METER_INGEST_PATH,
     deriveHost,
+    resolveEffectiveBaseUrl,
 } from './_dx_urls';
 
 // Lazy import marker — the generated layer's Configuration / ApiClient
@@ -133,7 +134,16 @@ export class Moolabs {
             throw new Error('apiKey must be a non-empty string');
         }
         this.apiKey = opts.apiKey;
-        this.baseUrl = opts.baseUrl ?? DEFAULT_BASE_URL;
+        // Apex ("moolabs.com") is a marketing/branding host, not an env
+        // root — the ALB cert is "*.prod.moolabs.com" only. Rewrite the
+        // customer-supplied baseUrl ONCE at construction so all downstream
+        // subdomain composition (deriveHost, IngestUrlResolver) sees the
+        // effective env-rooted host. Explicit env roots and self-hosted
+        // bases pass through unchanged. See _dx_urls.resolveEffectiveBaseUrl.
+        this.baseUrl = resolveEffectiveBaseUrl(
+            opts.baseUrl ?? DEFAULT_BASE_URL,
+            this.apiKey,
+        );
 
         // Validate baseUrl early so a typo crashes at construction.
         for (const backend of Object.keys(SUBDOMAIN_MAP) as Backend[]) {

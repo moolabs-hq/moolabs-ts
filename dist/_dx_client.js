@@ -93,7 +93,13 @@ class Moolabs {
             throw new Error('apiKey must be a non-empty string');
         }
         this.apiKey = opts.apiKey;
-        this.baseUrl = (_a = opts.baseUrl) !== null && _a !== void 0 ? _a : DEFAULT_BASE_URL;
+        // Apex ("moolabs.com") is a marketing/branding host, not an env
+        // root — the ALB cert is "*.prod.moolabs.com" only. Rewrite the
+        // customer-supplied baseUrl ONCE at construction so all downstream
+        // subdomain composition (deriveHost, IngestUrlResolver) sees the
+        // effective env-rooted host. Explicit env roots and self-hosted
+        // bases pass through unchanged. See _dx_urls.resolveEffectiveBaseUrl.
+        this.baseUrl = (0, _dx_urls_1.resolveEffectiveBaseUrl)((_a = opts.baseUrl) !== null && _a !== void 0 ? _a : DEFAULT_BASE_URL, this.apiKey);
         // Validate baseUrl early so a typo crashes at construction.
         for (const backend of Object.keys(_dx_routing_1.SUBDOMAIN_MAP)) {
             (0, _dx_urls_1.deriveHost)(backend, this.baseUrl); // throws on invalid baseUrl
