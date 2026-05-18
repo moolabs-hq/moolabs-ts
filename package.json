@@ -1,6 +1,6 @@
 {
   "name": "@moolabs/sdk",
-  "version": "0.2.0-rc8",
+  "version": "0.2.0-rc9",
   "description": "OpenAPI client for @moolabs/sdk",
   "author": "OpenAPI-Generator Contributors",
   "repository": {
