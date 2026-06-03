@@ -101,6 +101,103 @@ await client.usage.ingestEvents([
 ]);
 ```
 
+### Unified ergonomic ingest (recommended)
+
+Three object-arg methods cover usage, cost, and dual-lane emission. The
+SDK builds the CloudEvent envelope, validates required fields
+synchronously, and routes through the existing buffer + retry chain:
+
+```typescript
+// Usage-lane — meterSlug + value required.
+await client.usage.ingestEvent({
+  eventType: 'ai.chat',
+  customerId: 'cust_42',
+  entityId: 'req_abc',          // → data.request_id on the wire
+  meterSlug: 'llm_tokens',
+  value: 724,
+  source: 'my-app/v2.3.1',      // optional; defaults to "moolabs-sdk"
+  meta: { feature: 'ai_chat' }, // optional; nested at data.meta
+});
+
+// Cost-lane — per-span breakdown for AI cost intelligence.
+await client.cost.ingestEvent({
+  eventType: 'ai.chat.cost',
+  customerId: 'cust_42',
+  entityId: 'req_abc',
+  spans: [
+    { span_id: 'sp_chat', model: 'gpt-4o-mini', tokens: 724, cost: 0.000724 },
+  ],
+});
+
+// Dual-lane — usage + cost in one call.
+await client.events.ingest({
+  eventType: 'ai.chat',
+  customerId: 'cust_42',
+  entityId: 'req_abc',
+  meterSlug: 'llm_tokens',
+  value: 844,
+  spans: [{ span_id: 'sp_embed', model: 'text-embedding-3-small', tokens: 120, cost: 1.8e-7 }],
+});
+```
+
+Each returns an `IngestResult` with `eventId`, `transport`, and
+`acceptedAt`. `tenantId` is intentionally NOT a field — the server
+derives tenant identity from the API key.
+
+#### Canonical well-known data fields
+
+Seven AI-event fields are first-class — they accept camelCase kwargs
+and land at `data.<key>` (snake_case) on the wire. Use them directly
+instead of nesting under `meta`. Free-form fields keep going through
+`meta` and nest at `data.meta.<key>`.
+
+| kwarg | wire | example |
+|---|---|---|
+| `provider` | `data.provider` | `"openai"` |
+| `model` | `data.model` | `"gpt-4o"` |
+| `totalInputTokens` | `data.total_input_tokens` | `1250` |
+| `totalOutputTokens` | `data.total_output_tokens` | `3800` |
+| `totalTokens` | `data.total_tokens` | `5050` |
+| `latencyMs` | `data.latency_ms` | `2340` |
+| `status` | `data.status` | `"success"` |
+
+```typescript
+await client.usage.ingestEvent({
+  eventType: 'ai.completion',
+  customerId: 'cust_acme_42',
+  entityId: 'req_a1b2c3d4',
+  meterSlug: 'ai_tokens',
+  value: 1,
+  provider: 'openai',
+  model: 'gpt-4o',
+  totalInputTokens: 1250,
+  totalOutputTokens: 3800,
+  totalTokens: 5050,
+  latencyMs: 2340,
+  status: 'success',
+  meta: { feature_key: 'ai_chat' }, // customer-defined → data.meta.feature_key
+});
+```
+
+Spans on the cost lane accept both `span_id` (canonical, matches Py/Go)
+and `spanId` (TS-internal alias); the SDK normalizes to `span_id` on the
+wire — moo-acute's per-span dedup grain is `sdk:{span_id}`, so the
+canonical key must reach the wire.
+
+### Pointing the SDK at a non-default ingest host
+
+Set `MOOLABS_INGEST_HOST` (read via `process.env`) to override the F2
+region fallback for self-hosted, preview, or hybrid deployments:
+
+```bash
+export MOOLABS_INGEST_HOST=meter.dev.moolabs.com    # https:// auto-added
+# OR
+export MOOLABS_INGEST_HOST=https://my-relay.example.com
+```
+
+Mirrored on Python (`os.environ`) and Go (`os.Getenv`). Browser bundles
+where `process` is undefined silently no-op.
+
 #### Event delivery semantics — IMPORTANT for browser SDK users
 
 The TypeScript SDK delivers events with **at-most-once semantics by default**.

@@ -40,6 +40,7 @@ const _dx_namespaces_1 = require("./_dx_namespaces");
 const _dx_post_1 = require("./_dx_post");
 const _dx_routing_1 = require("./_dx_routing");
 const _dx_urls_1 = require("./_dx_urls");
+const _dx_urls_2 = require("./_dx_urls");
 const DEFAULT_BASE_URL = 'moolabs.com';
 // CloudEvents batch ingest path is METER_INGEST_PATH (imported from
 // _dx_urls.ts so both the resolver and the direct-post path agree on
@@ -47,7 +48,7 @@ const DEFAULT_BASE_URL = 'moolabs.com';
 // (application/cloudevents-batch+json) lives in _dx_post.ts where the
 // actual fetch happens — keeping the header next to the request body
 // it describes.
-const INGEST_PATH = _dx_urls_1.METER_INGEST_PATH;
+const INGEST_PATH = _dx_urls_2.METER_INGEST_PATH;
 const noopLogger = () => { };
 /** PascalCase → kebab-case file name (TS generator emits kebab-case files:
  *  "WalletsApi" → "wallets-api.ts"). Exported for the cross-language parity job. */
@@ -89,6 +90,12 @@ class Moolabs {
         this.inflightDrains = new Set();
         this.clients = new Map();
         this.namespaces = new Map();
+        /** US-008: events is special — it's NOT in CAPABILITY_MAP (no backing
+         *  API classes; it's a pure wrapper over EventsApi against the
+         *  F2-resolved meter URL). Cached separately from `namespaces` so
+         *  the generic dispatch loop doesn't try to look it up via the
+         *  capability map. */
+        this.eventsNamespace = null;
         if (typeof opts.apiKey !== 'string' || opts.apiKey.length === 0) {
             throw new Error('apiKey must be a non-empty string');
         }
@@ -99,16 +106,16 @@ class Moolabs {
         // subdomain composition (deriveHost, IngestUrlResolver) sees the
         // effective env-rooted host. Explicit env roots and self-hosted
         // bases pass through unchanged. See _dx_urls.resolveEffectiveBaseUrl.
-        this.baseUrl = (0, _dx_urls_1.resolveEffectiveBaseUrl)((_a = opts.baseUrl) !== null && _a !== void 0 ? _a : DEFAULT_BASE_URL, this.apiKey);
+        this.baseUrl = (0, _dx_urls_2.resolveEffectiveBaseUrl)((_a = opts.baseUrl) !== null && _a !== void 0 ? _a : DEFAULT_BASE_URL, this.apiKey);
         // Validate baseUrl early so a typo crashes at construction.
         for (const backend of Object.keys(_dx_routing_1.SUBDOMAIN_MAP)) {
-            (0, _dx_urls_1.deriveHost)(backend, this.baseUrl); // throws on invalid baseUrl
+            (0, _dx_urls_2.deriveHost)(backend, this.baseUrl); // throws on invalid baseUrl
         }
         this.bufferEnabled = opts.buffer !== false; // default true
         this.bufferMax = (_b = opts.bufferMax) !== null && _b !== void 0 ? _b : 1000; // matches DEFAULT_INGEST_BUFFER_CONFIG.maxSize
         // Optional per-event logger; default = no output.
         this.logger = (_c = opts.logger) !== null && _c !== void 0 ? _c : noopLogger;
-        this.ingestResolver = new _dx_urls_1.IngestUrlResolver({
+        this.ingestResolver = new _dx_urls_2.IngestUrlResolver({
             baseUrl: this.baseUrl,
             discoveryFn: () => this.discoverTenantConfig(),
         });
@@ -125,6 +132,31 @@ class Moolabs {
     get collections() { return this.ns('collections'); }
     get cost() { return this.ns('cost'); }
     get notifications() { return this.ns('notifications'); }
+    /** US-008: unified-surface events namespace.
+     *
+     *  Provides `client.events.ingest({ ... })` — a single method that
+     *  can emit a CloudEvent carrying BOTH a usage lane (meterSlug +
+     *  value) AND a cost lane (spans) in one envelope when a customer
+     *  has both at the same call site.
+     *
+     *  For single-lane customers, prefer the dedicated entry points
+     *  (`client.usage.ingestEvent` or `client.cost.ingestEvent`) —
+     *  their required-args signatures make the lane intent explicit
+     *  at the call site.
+     *
+     *  Lazy: the namespace is constructed on first access and cached
+     *  for the lifetime of the `Moolabs` instance. */
+    get events() {
+        if (this.eventsNamespace === null) {
+            this.eventsNamespace = new _dx_namespaces_1.EventsNamespace({
+                ingestResolver: this.ingestResolver,
+                ingestBuffer: this.lazyBuffer(),
+                makeClientAtUrl: (url) => this.makeClientAtUrl(url),
+                importApiClass,
+            });
+        }
+        return this.eventsNamespace;
+    }
     // ── Lifecycle ────────────────────────────────────────────────────────
     close() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -153,6 +185,9 @@ class Moolabs {
             // our caches.
             this.clients.clear();
             this.namespaces.clear();
+            // US-008: release the events namespace cache so the same lifecycle
+            // applies as the per-capability namespaces post-close.
+            this.eventsNamespace = null;
         });
     }
     toString() {
@@ -167,7 +202,13 @@ class Moolabs {
             getClient: (b) => this.getClient(b),
             importApiClass,
         };
-        if (capability === 'usage') {
+        if (capability === 'usage' || capability === 'cost') {
+            // US-007: cost capability also receives the F2 resolver +
+            // buffer + makeClientAtUrl for the new ergonomic
+            // client.cost.ingestEvent(...) method that routes via the
+            // unified meter endpoint (NOT acute). Legacy cost methods
+            // (ingestEventsBatch, ingestSdkSpans, submitAdjustment)
+            // continue to use the normal per-backend ApiClient.
             opts.ingestResolver = this.ingestResolver;
             opts.ingestBuffer = this.lazyBuffer();
             opts.makeClientAtUrl = (url) => this.makeClientAtUrl(url);
@@ -180,7 +221,7 @@ class Moolabs {
         const cached = this.clients.get(backend);
         if (cached !== undefined)
             return cached;
-        const host = (0, _dx_urls_1.deriveHost)(backend, this.baseUrl);
+        const host = (0, _dx_urls_2.deriveHost)(backend, this.baseUrl);
         const client = this.makeClientAtUrl(host);
         this.clients.set(backend, client);
         return client;
@@ -190,7 +231,13 @@ class Moolabs {
         // Lazy-load via require so `import { Moolabs }` is fast.
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const mod = require('./configuration');
-        return new mod.Configuration({ basePath: host, accessToken: this.apiKey });
+        // Path-doubling guard (sibling fix to Python _strip_path): the F2
+        // IngestUrlResolver emits full URLs INCLUDING /api/v1/events, but
+        // axios's Configuration uses basePath verbatim and the generated
+        // API method appends the operation path from the spec, producing
+        // /api/v1/events/api/v1/events. Collapse to scheme+host first.
+        const basePath = (0, _dx_urls_1.stripPath)(host);
+        return new mod.Configuration({ basePath, accessToken: this.apiKey });
     }
     lazyBuffer() {
         if (!this.bufferEnabled)
@@ -289,8 +336,8 @@ class Moolabs {
     }
     discoverTenantConfig() {
         return __awaiter(this, void 0, void 0, function* () {
-            const host = (0, _dx_urls_1.deriveHost)('bff', this.baseUrl);
-            const url = `${host}${_dx_urls_1.DISCOVERY_PATH}`;
+            const host = (0, _dx_urls_2.deriveHost)('bff', this.baseUrl);
+            const url = `${host}${_dx_urls_2.DISCOVERY_PATH}`;
             // Use the platform's fetch (Node 18+ has it natively; older Node + bun
             // also expose it). Customers on Node <18 should polyfill at app level.
             const resp = yield fetch(url, {

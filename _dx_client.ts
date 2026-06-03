@@ -24,9 +24,10 @@
  */
 
 import { IngestBuffer, type IngestBufferConfig } from './_dx_buffer';
-import { type Namespace, makeNamespace, isTerminalIngestError } from './_dx_namespaces';
+import { type Namespace, EventsNamespace, makeNamespace, isTerminalIngestError } from './_dx_namespaces';
 import { postEventsBatchAndClassify } from './_dx_post';
 import { CAPABILITY_ORDER, type Backend, SUBDOMAIN_MAP } from './_dx_routing';
+import { stripPath } from './_dx_urls';
 import {
     DISCOVERY_PATH,
     IngestUrlResolver,
@@ -129,6 +130,13 @@ export class Moolabs {
     private readonly clients = new Map<Backend, unknown>();
     private readonly namespaces = new Map<string, Namespace>();
 
+    /** US-008: events is special — it's NOT in CAPABILITY_MAP (no backing
+     *  API classes; it's a pure wrapper over EventsApi against the
+     *  F2-resolved meter URL). Cached separately from `namespaces` so
+     *  the generic dispatch loop doesn't try to look it up via the
+     *  capability map. */
+    private eventsNamespace: EventsNamespace | null = null;
+
     constructor(opts: MoolabsOptions) {
         if (typeof opts.apiKey !== 'string' || opts.apiKey.length === 0) {
             throw new Error('apiKey must be a non-empty string');
@@ -175,6 +183,32 @@ export class Moolabs {
     get cost(): Namespace         { return this.ns('cost'); }
     get notifications(): Namespace { return this.ns('notifications'); }
 
+    /** US-008: unified-surface events namespace.
+     *
+     *  Provides `client.events.ingest({ ... })` — a single method that
+     *  can emit a CloudEvent carrying BOTH a usage lane (meterSlug +
+     *  value) AND a cost lane (spans) in one envelope when a customer
+     *  has both at the same call site.
+     *
+     *  For single-lane customers, prefer the dedicated entry points
+     *  (`client.usage.ingestEvent` or `client.cost.ingestEvent`) —
+     *  their required-args signatures make the lane intent explicit
+     *  at the call site.
+     *
+     *  Lazy: the namespace is constructed on first access and cached
+     *  for the lifetime of the `Moolabs` instance. */
+    get events(): EventsNamespace {
+        if (this.eventsNamespace === null) {
+            this.eventsNamespace = new EventsNamespace({
+                ingestResolver: this.ingestResolver,
+                ingestBuffer: this.lazyBuffer(),
+                makeClientAtUrl: (url) => this.makeClientAtUrl(url),
+                importApiClass,
+            });
+        }
+        return this.eventsNamespace;
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     async close(): Promise<void> {
@@ -207,6 +241,9 @@ export class Moolabs {
         // our caches.
         this.clients.clear();
         this.namespaces.clear();
+        // US-008: release the events namespace cache so the same lifecycle
+        // applies as the per-capability namespaces post-close.
+        this.eventsNamespace = null;
     }
 
     toString(): string {
@@ -222,7 +259,13 @@ export class Moolabs {
             getClient: (b) => this.getClient(b),
             importApiClass,
         };
-        if (capability === 'usage') {
+        if (capability === 'usage' || capability === 'cost') {
+            // US-007: cost capability also receives the F2 resolver +
+            // buffer + makeClientAtUrl for the new ergonomic
+            // client.cost.ingestEvent(...) method that routes via the
+            // unified meter endpoint (NOT acute). Legacy cost methods
+            // (ingestEventsBatch, ingestSdkSpans, submitAdjustment)
+            // continue to use the normal per-backend ApiClient.
             opts.ingestResolver = this.ingestResolver;
             opts.ingestBuffer = this.lazyBuffer();
             opts.makeClientAtUrl = (url) => this.makeClientAtUrl(url);
@@ -246,7 +289,13 @@ export class Moolabs {
         // Lazy-load via require so `import { Moolabs }` is fast.
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const mod = require('./configuration') as { Configuration: GeneratedConfiguration };
-        return new mod.Configuration({ basePath: host, accessToken: this.apiKey });
+        // Path-doubling guard (sibling fix to Python _strip_path): the F2
+        // IngestUrlResolver emits full URLs INCLUDING /api/v1/events, but
+        // axios's Configuration uses basePath verbatim and the generated
+        // API method appends the operation path from the spec, producing
+        // /api/v1/events/api/v1/events. Collapse to scheme+host first.
+        const basePath = stripPath(host);
+        return new mod.Configuration({ basePath, accessToken: this.apiKey });
     }
 
     private lazyBuffer(): IngestBuffer<unknown> | null {

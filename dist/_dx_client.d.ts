@@ -22,7 +22,7 @@
  *
  * 11 capability getters replace the 2 service namespaces (cls / meter).
  */
-import { type Namespace } from './_dx_namespaces';
+import { type Namespace, EventsNamespace } from './_dx_namespaces';
 /** Optional per-event diagnostic callback. SDK invokes this on
  *  terminal_drop, overflow, abandoned-on-shutdown, drain-failure events
  *  with a stable msg id + a structured fields object.
@@ -56,6 +56,12 @@ export declare class Moolabs {
     private readonly inflightDrains;
     private readonly clients;
     private readonly namespaces;
+    /** US-008: events is special — it's NOT in CAPABILITY_MAP (no backing
+     *  API classes; it's a pure wrapper over EventsApi against the
+     *  F2-resolved meter URL). Cached separately from `namespaces` so
+     *  the generic dispatch loop doesn't try to look it up via the
+     *  capability map. */
+    private eventsNamespace;
     constructor(opts: MoolabsOptions);
     get usage(): Namespace;
     get customers(): Namespace;
@@ -68,6 +74,21 @@ export declare class Moolabs {
     get collections(): Namespace;
     get cost(): Namespace;
     get notifications(): Namespace;
+    /** US-008: unified-surface events namespace.
+     *
+     *  Provides `client.events.ingest({ ... })` — a single method that
+     *  can emit a CloudEvent carrying BOTH a usage lane (meterSlug +
+     *  value) AND a cost lane (spans) in one envelope when a customer
+     *  has both at the same call site.
+     *
+     *  For single-lane customers, prefer the dedicated entry points
+     *  (`client.usage.ingestEvent` or `client.cost.ingestEvent`) —
+     *  their required-args signatures make the lane intent explicit
+     *  at the call site.
+     *
+     *  Lazy: the namespace is constructed on first access and cached
+     *  for the lifetime of the `Moolabs` instance. */
+    get events(): EventsNamespace;
     close(): Promise<void>;
     toString(): string;
     private ns;

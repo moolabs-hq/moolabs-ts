@@ -26,6 +26,20 @@
  */
 import { type Backend } from './_dx_routing';
 export declare const METER_INGEST_PATH = "/api/v1/events";
+/** Strip path / query / fragment from a URL, returning only scheme + host.
+ *
+ *  The F2 IngestUrlResolver emits full URLs like
+ *  `https://meter.moolabs.com/api/v1/events`, but axios's Configuration
+ *  treats `basePath=` as a literal prefix and the generated method
+ *  appends the operation path from the spec, producing
+ *  `/api/v1/events/api/v1/events`. Collapsing to scheme + host before
+ *  handing the value to Configuration is the single-source-of-truth fix.
+ *
+ *  A bare host like `https://meter.moolabs.com` is preserved verbatim.
+ *  Sibling of Python's _strip_path and Go's stripPath. Cross-language
+ *  parity is asserted by the US-013 envelope-parity test.
+ */
+export declare function stripPath(hostOrUrl: string): string;
 declare const DISCOVERY_PATH = "/v1/tenant/config";
 /**
  * Strip scheme and trailing slash from a caller-provided baseUrl and
@@ -115,6 +129,10 @@ export declare class IngestUrlResolver {
         config?: Partial<IngestResolverConfig>;
         clock?: Clock;
     });
+    /** Env-pinned URL captured at construction from MOOLABS_INGEST_HOST.
+     *  null when no env override was set. Sticky across reportPostOutcome
+     *  cache invalidation. */
+    private envPinnedUrl;
     /** Run the F2 chain and return a URL to POST events to. Async because
      *  step 2 may invoke the discovery HTTP callback. Always resolves;
      *  discovery failures fall through to step 3/4 rather than rejecting. */

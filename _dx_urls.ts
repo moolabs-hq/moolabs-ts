@@ -33,6 +33,28 @@ import {
 } from './_dx_routing';
 
 export const METER_INGEST_PATH = '/api/v1/events';
+
+/** Strip path / query / fragment from a URL, returning only scheme + host.
+ *
+ *  The F2 IngestUrlResolver emits full URLs like
+ *  `https://meter.moolabs.com/api/v1/events`, but axios's Configuration
+ *  treats `basePath=` as a literal prefix and the generated method
+ *  appends the operation path from the spec, producing
+ *  `/api/v1/events/api/v1/events`. Collapsing to scheme + host before
+ *  handing the value to Configuration is the single-source-of-truth fix.
+ *
+ *  A bare host like `https://meter.moolabs.com` is preserved verbatim.
+ *  Sibling of Python's _strip_path and Go's stripPath. Cross-language
+ *  parity is asserted by the US-013 envelope-parity test.
+ */
+export function stripPath(hostOrUrl: string): string {
+    try {
+        const u = new URL(hostOrUrl);
+        return `${u.protocol}//${u.host}`;
+    } catch {
+        return hostOrUrl;
+    }
+}
 const DISCOVERY_PATH = '/v1/tenant/config';   // exported below for client use
 
 
@@ -236,7 +258,51 @@ export class IngestUrlResolver {
         this.region = opts.region ?? DEFAULT_REGION;
         this.config = { ...DEFAULT_INGEST_RESOLVER_CONFIG, ...(opts.config ?? {}) };
         this.clock = opts.clock ?? defaultClock;
+
+        // MOOLABS_INGEST_HOST env var override — short-circuits the F2 chain.
+        // Customers running on single-region self-hosted or non-standard
+        // cloud deployments (e.g., a regional ingest subdomain that hasn't
+        // been provisioned yet) can pin the ingest host explicitly. Set
+        // this BEFORE the resolver runs through steps 2-4; the value
+        // populates cachedUrl so step-1 returns it verbatim.
+        //
+        // Accepts either a bare host (`meter.dev.moolabs.com`,
+        // `https://meter.dev.moolabs.com`) or a full URL — the path-
+        // doubling guard in makeClientAtUrl normalizes either form.
+        // Empty string is treated as unset. Sibling of Python's MOOLABS_
+        // INGEST_HOST override.
+        //
+        // process.env access is wrapped in a typeof check so the SDK
+        // runs in browser contexts (where `process` is undefined) without
+        // crashing — the override silently no-ops there.
+        let ingestHostEnv: string | undefined;
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            if (typeof process !== 'undefined' && (process as any).env) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                ingestHostEnv = (process as any).env.MOOLABS_INGEST_HOST;
+            }
+        } catch {
+            // Browser environments may throw on `process` access; treat as unset.
+            ingestHostEnv = undefined;
+        }
+        if (ingestHostEnv) {
+            const withScheme = ingestHostEnv.startsWith('http://') || ingestHostEnv.startsWith('https://')
+                ? ingestHostEnv
+                : `https://${ingestHostEnv}`;
+            this.cachedUrl = withScheme;
+            // Stickiness: env pin survives reportPostOutcome cache clearing
+            // (Phase 2 review 2026-06-03 Finding 3). Without this, N
+            // transient failures silently fall back to the F2 chain which
+            // derives a possibly-dead regional host.
+            this.envPinnedUrl = withScheme;
+        }
     }
+
+    /** Env-pinned URL captured at construction from MOOLABS_INGEST_HOST.
+     *  null when no env override was set. Sticky across reportPostOutcome
+     *  cache invalidation. */
+    private envPinnedUrl: string | null = null;
 
     /** Run the F2 chain and return a URL to POST events to. Async because
      *  step 2 may invoke the discovery HTTP callback. Always resolves;
@@ -283,7 +349,15 @@ export class IngestUrlResolver {
         this.postFailures.set(url, count);
         if (count >= this.config.postFailureThreshold) {
             if (this.cachedUrl === url) {
-                this.cachedUrl = null;
+                // Env-pinned URL is sticky (Phase 2 review Finding 3): if
+                // the operator explicitly set MOOLABS_INGEST_HOST, don't
+                // fall through to F2 (which derives a possibly-dead
+                // regional host). Keep the cache populated with the pin.
+                if (this.envPinnedUrl !== null && url === this.envPinnedUrl) {
+                    // Keep cachedUrl === envPinnedUrl.
+                } else {
+                    this.cachedUrl = null;
+                }
             }
             this.recentlyFailed.set(url, this.clock() + this.config.recentlyFailedTtlSec);
             this.postFailures.delete(url);
