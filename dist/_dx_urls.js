@@ -255,14 +255,15 @@ class IngestUrlResolver {
             this.cachedUrl = withScheme;
             // Stickiness: env pin survives reportPostOutcome cache clearing
             // (Phase 2 review 2026-06-03 Finding 3). Without this, N
-            // transient failures silently fall back to the F2 chain which
-            // derives a possibly-dead regional host.
+            // transient failures would silently fall back to step 4 and
+            // substitute `meter.{baseUrl}` for the operator's explicit pin.
             this.envPinnedUrl = withScheme;
         }
     }
     /** Run the F2 chain and return a URL to POST events to. Async because
      *  step 2 may invoke the discovery HTTP callback. Always resolves;
-     *  discovery failures fall through to step 3/4 rather than rejecting. */
+     *  discovery failures fall through to step 4 (`meter.{baseUrl}`) rather
+     *  than rejecting. */
     getIngestUrl() {
         return __awaiter(this, void 0, void 0, function* () {
             this.expireRecentlyFailed();
@@ -285,7 +286,7 @@ class IngestUrlResolver {
                     return discovered;
                 }
             }
-            // Step 3 — region map fallback
+            // Step 4 — meter host (no discovery this call).
             return this.regionFallbackUrl();
         });
     }
@@ -306,8 +307,9 @@ class IngestUrlResolver {
             if (this.cachedUrl === url) {
                 // Env-pinned URL is sticky (Phase 2 review Finding 3): if
                 // the operator explicitly set MOOLABS_INGEST_HOST, don't
-                // fall through to F2 (which derives a possibly-dead
-                // regional host). Keep the cache populated with the pin.
+                // fall through to step 4 (which would silently substitute
+                // `meter.{baseUrl}` for the operator's pin). Keep the cache
+                // populated with the pin.
                 if (this.envPinnedUrl !== null && url === this.envPinnedUrl) {
                     // Keep cachedUrl === envPinnedUrl.
                 }
@@ -400,16 +402,35 @@ class IngestUrlResolver {
             return fullUrl;
         });
     }
+    /**
+     * Return `meter.{baseUrl}/api/v1/events` — the single source of truth
+     * for ingest when discovery (step 2) is unavailable or has failed.
+     *
+     * Earlier versions of this method tried to construct regional ingest
+     * hosts (`https://ingest.{regionCode}.{baseUrl}/api/v1/events`) from
+     * the SDK's local region map. Two problems with that:
+     *
+     * 1. Wrong URL for non-apex baseUrls. For `dev.moolabs.com` or any
+     *    customer-chosen env root, there is no `ingest.{region}.{root}`
+     *    subdomain — DNS doesn't resolve, the POST fails. The first N
+     *    events per process lifetime would be silently lost before the
+     *    recentlyFailed mark caused the SDK to fall through.
+     *
+     * 2. Local region construction is a guess. The right place to learn
+     *    the customer's regional ingest URL is BFF discovery (step 2 via
+     *    `/v1/tenant/config`). When discovery is enabled and reachable,
+     *    it returns the authoritative URL; the SDK should NEVER guess
+     *    from a local region map. When discovery is unavailable,
+     *    `meter.{baseUrl}` is the always-derivable steady-state route
+     *    for env-rooted and self-hosted bases per contracts §3.5a.
+     *
+     * Result: every call routes to `meter.{baseUrl}/api/v1/events` from
+     * #1 onward — no lossy preamble, no regional URL guessing.
+     * Multi-region routing still works via discovery (step 2) when the
+     * customer opts in via `enableIngestDiscovery: true`.
+     */
     regionFallbackUrl() {
-        const regionCode = _dx_routing_1.REGION_INGEST_MAP[this.region];
-        if (regionCode === undefined) {
-            return this.step4LastResortUrl();
-        }
-        const candidate = `https://ingest.${regionCode}.${this.baseUrl}${exports.METER_INGEST_PATH}`;
-        if (this.recentlyFailed.has(candidate)) {
-            return this.step4LastResortUrl();
-        }
-        return candidate;
+        return this.step4LastResortUrl();
     }
     expireRecentlyFailed() {
         const now = this.clock();

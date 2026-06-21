@@ -90,7 +90,8 @@ export declare function hostMatchesBaseUrl(rawUrl: string, baseUrl: string): boo
  */
 export interface IngestResolverConfig {
     /** Bounded TTL on a failed discovery attempt. Within this window the
-     *  SDK skips re-trying discovery and goes straight to step 3. */
+     *  SDK skips re-trying discovery and routes to step 4 (`meter.{baseUrl}`)
+     *  directly. */
     readonly discoveryRetryTtlSec: number;
     /** Consecutive POST failures to a cached URL before cache invalidation. */
     readonly postFailureThreshold: number;
@@ -135,7 +136,8 @@ export declare class IngestUrlResolver {
     private envPinnedUrl;
     /** Run the F2 chain and return a URL to POST events to. Async because
      *  step 2 may invoke the discovery HTTP callback. Always resolves;
-     *  discovery failures fall through to step 3/4 rather than rejecting. */
+     *  discovery failures fall through to step 4 (`meter.{baseUrl}`) rather
+     *  than rejecting. */
     getIngestUrl(): Promise<string>;
     /** Update state based on the outcome of POSTing to `url`.
      *
@@ -156,6 +158,33 @@ export declare class IngestUrlResolver {
     };
     get cached(): string | null;
     private tryDiscovery;
+    /**
+     * Return `meter.{baseUrl}/api/v1/events` — the single source of truth
+     * for ingest when discovery (step 2) is unavailable or has failed.
+     *
+     * Earlier versions of this method tried to construct regional ingest
+     * hosts (`https://ingest.{regionCode}.{baseUrl}/api/v1/events`) from
+     * the SDK's local region map. Two problems with that:
+     *
+     * 1. Wrong URL for non-apex baseUrls. For `dev.moolabs.com` or any
+     *    customer-chosen env root, there is no `ingest.{region}.{root}`
+     *    subdomain — DNS doesn't resolve, the POST fails. The first N
+     *    events per process lifetime would be silently lost before the
+     *    recentlyFailed mark caused the SDK to fall through.
+     *
+     * 2. Local region construction is a guess. The right place to learn
+     *    the customer's regional ingest URL is BFF discovery (step 2 via
+     *    `/v1/tenant/config`). When discovery is enabled and reachable,
+     *    it returns the authoritative URL; the SDK should NEVER guess
+     *    from a local region map. When discovery is unavailable,
+     *    `meter.{baseUrl}` is the always-derivable steady-state route
+     *    for env-rooted and self-hosted bases per contracts §3.5a.
+     *
+     * Result: every call routes to `meter.{baseUrl}/api/v1/events` from
+     * #1 onward — no lossy preamble, no regional URL guessing.
+     * Multi-region routing still works via discovery (step 2) when the
+     * customer opts in via `enableIngestDiscovery: true`.
+     */
     private regionFallbackUrl;
     private expireRecentlyFailed;
 }

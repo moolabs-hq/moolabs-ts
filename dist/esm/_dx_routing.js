@@ -24,14 +24,18 @@ export const SUBDOMAIN_MAP = {
     acute: 'acute',
 };
 /**
- * Region → ingest-host subdomain. F2 fallback chain step 3 composes
- * `https://ingest.{regionCode}.{baseUrl}` from this map plus a region
- * source (today: hardcoded "us"; future: extracted from the API key).
+ * Region → ingest-host subdomain. Retained for cross-language parity and
+ * as forward-compat metadata for discovery-returned regional URLs. The SDK
+ * no longer composes `https://ingest.{regionCode}.{baseUrl}` locally —
+ * regional URL selection is BFF's responsibility (F2 chain step 2
+ * discovery). When discovery is unavailable or fails, the SDK falls through
+ * directly to `meter.{baseUrl}/api/v1/events` (see `_dx_urls.ts` step 4
+ * and contracts §3.5 historical note).
  *
  * Mirrors BFF's REGION_INGEST_MAP in
- * services/moolabs-app/bff/app/api/v1/tenant_config.py. Drift would surface
- * as wrong-region ingest during F2 fallback; values are kept identical by
- * convention. Update both sides together.
+ * services/moolabs-app/bff/app/api/v1/tenant_config.py. Drift would still
+ * surface as wrong-region ingest in discovery responses; values are kept
+ * identical by convention. Update both sides together.
  */
 export const REGION_INGEST_MAP = {
     'us-east-1': 'us',
