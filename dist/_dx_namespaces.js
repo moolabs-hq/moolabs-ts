@@ -127,6 +127,36 @@ function checkSpansHaveSpanIds(spans) {
         }
     });
 }
+/** Every cost-lane span MUST carry a non-empty `provider` and `model`.
+ *
+ *  Acute's cost-enricher rejects spans without both via a silent `continue`
+ *  at `services/moo-acute/app/workers/cost_enricher.py`; events with all-
+ *  invalid spans produce NO log line at acute, making the drop invisible
+ *  to operators. Reject up front so the failure surfaces at the call site
+ *  rather than as a downstream "cost event silently disappeared"
+ *  investigation.
+ *
+ *  Accepts both `provider`/`model` (canonical snake_case wire shape) and
+ *  the camelCase TS-internal aliases. */
+function checkCostSpansHaveProviderAndModel(spans) {
+    spans.forEach((span, i) => {
+        if (span === null || typeof span !== 'object' || Array.isArray(span)) {
+            // Caught by checkSpansHaveSpanIds already; defensive only.
+            return;
+        }
+        const s = span;
+        if (typeof s.provider !== 'string' || s.provider.length === 0) {
+            throw new Error(`spans[${i}].provider must be a non-empty string — spans without ` +
+                `provider are silently dropped during downstream cost processing, ` +
+                `resulting in missing cost-attribution data`);
+        }
+        if (typeof s.model !== 'string' || s.model.length === 0) {
+            throw new Error(`spans[${i}].model must be a non-empty string — spans without ` +
+                `model are silently dropped during downstream cost processing, ` +
+                `resulting in missing cost-attribution data`);
+        }
+    });
+}
 /** Verify `meta` JSON-serializes cleanly. `JSON.stringify` silently
  *  coerces some non-serializable types (Set → {}, Map → {}), so we
  *  also walk the value tree to reject those explicitly — matching
@@ -207,6 +237,26 @@ function buildEnvelope(args) {
     }
     if (spans !== undefined) {
         checkSpansHaveSpanIds(spans);
+        // Lane discriminator: USAGE envelopes carry meterSlug+value and may
+        // optionally include spans as supplemental context (e.g. event
+        // lineage or per-span breakdown attached to a usage emit). Those
+        // spans don't flow through the downstream cost-enrichment pipeline
+        // and don't need provider/model. COST envelopes carry ONLY spans
+        // (no meterSlug, no value) and DO flow to the cost-enrichment
+        // pipeline, which silently drops spans without provider+model. The
+        // provider+model check fires only on the cost lane.
+        //
+        // Empty string is treated as equivalent to undefined for meterSlug —
+        // matches the Go SDK's `args.MeterSlug == ""` semantics where empty
+        // string is the natural zero value. Without this, a caller passing
+        // `meterSlug: ""` (explicit empty, not undefined) would silently
+        // bypass the cost-span check.
+        const isCostLane = (meterSlug === undefined || meterSlug === '') && value === undefined;
+        if (isCostLane &&
+            ((typeof provider !== 'string' || provider.length === 0) ||
+                (typeof model !== 'string' || model.length === 0))) {
+            checkCostSpansHaveProviderAndModel(spans);
+        }
     }
     if (meta !== undefined) {
         checkMetaIsJsonSerializable(meta);

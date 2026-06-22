@@ -120,12 +120,15 @@ await client.usage.ingestEvent({
 });
 
 // Cost-lane — per-span breakdown for AI cost intelligence.
+// Cost-lane spans MUST carry "provider" and "model" — the SDK rejects
+// spans missing either at the call site, since downstream cost
+// processing silently drops them otherwise.
 await client.cost.ingestEvent({
   eventType: 'ai.chat.cost',
   customerId: 'cust_42',
   entityId: 'req_abc',
   spans: [
-    { span_id: 'sp_chat', model: 'gpt-4o-mini', tokens: 724, cost: 0.000724 },
+    { span_id: 'sp_chat', provider: 'openai', model: 'gpt-4o-mini', tokens: 724, cost: 0.000724 },
   ],
 });
 
@@ -136,7 +139,7 @@ await client.events.ingest({
   entityId: 'req_abc',
   meterSlug: 'llm_tokens',
   value: 844,
-  spans: [{ span_id: 'sp_embed', model: 'text-embedding-3-small', tokens: 120, cost: 1.8e-7 }],
+  spans: [{ span_id: 'sp_embed', provider: 'openai', model: 'text-embedding-3-small', tokens: 120, cost: 1.8e-7 }],
 });
 ```
 
